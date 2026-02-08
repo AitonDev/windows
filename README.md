@@ -169,3 +169,4 @@ In your n8n HTTP Request node:
 - Cropped images are saved as JPEG with quality 95
 - YOLO model (yolov8n.pt) is downloaded automatically on first use
 - Object detection supports 80 COCO classes (person, car, dog, etc.)
+# windows
