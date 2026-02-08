@@ -162,6 +162,42 @@ In your n8n HTTP Request node:
 }
 ```
 
+## Deployment on Render
+
+This FastAPI app can be deployed directly on Render. **You don't need Vercel** - Render can host FastAPI/Flask apps natively.
+
+### Quick Deploy
+
+1. **Push to GitHub** (already done):
+   ```bash
+   git push origin main
+   ```
+
+2. **Deploy on Render**:
+   - Go to [Render Dashboard](https://dashboard.render.com)
+   - Click "New +" → "Web Service"
+   - Connect your GitHub repository: `AitonDev/windows`
+   - Render will auto-detect the `render.yaml` configuration
+   - Or manually configure:
+     - **Name**: `windows-api`
+     - **Environment**: `Python 3`
+     - **Build Command**: `pip install -r requirements.txt`
+     - **Start Command**: `uvicorn app:app --host 0.0.0.0 --port $PORT`
+   
+3. **Set Environment Variables** (optional):
+   - `IMGBB_API_KEY` - For image hosting (optional)
+   - `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET` - For Cloudinary (optional)
+   - `OUTPUT_DIR` - Defaults to `./cropped_images`
+
+4. **Deploy!** Your API will be available at `https://your-app.onrender.com`
+
+### Why Render instead of Vercel?
+
+- **Render**: Can host full FastAPI/Flask apps with persistent processes, file storage, and long-running tasks
+- **Vercel**: Better for serverless functions and static sites. Your FastAPI app needs a persistent server, so Render is the better choice.
+
+Your API endpoint will be: `https://your-app.onrender.com/crop-image`
+
 ## Notes
 
 - Images are saved in `./cropped_images/` by default (or `OUTPUT_DIR` env var)
@@ -169,4 +205,3 @@ In your n8n HTTP Request node:
 - Cropped images are saved as JPEG with quality 95
 - YOLO model (yolov8n.pt) is downloaded automatically on first use
 - Object detection supports 80 COCO classes (person, car, dog, etc.)
-# windows
