@@ -423,6 +423,10 @@ def process_single_image(
                 "label": label,
                 "source_image": image_url,
                 "image_index": image_index + 1,
+                "dimensions": {
+                    "width": cropped.width,
+                    "height": cropped.height
+                },
                 "bbox": {
                     "x": bbox.x,
                     "y": bbox.y,
