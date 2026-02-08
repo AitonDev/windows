@@ -1,9 +1,9 @@
 """
 Image to Image Generator API:
-- Accepts an image URL
-- Downloads the image
-- Extracts/crops bounding boxes from the image
-- Returns cropped images
+- Accepts one or more image URLs
+- Downloads the images
+- Extracts/crops bounding boxes from the images
+- Returns all cropped images together
 
 Run:
   pip install -r requirements.txt
@@ -11,20 +11,30 @@ Run:
 
 API Usage:
   POST /crop-image
-  Body (JSON):
-    {
-      "image_url": "https://example.com/image.jpg",
-      "bounding_boxes": [
-        {"x": 100, "y": 100, "width": 200, "height": 200, "label": "object1"},
-        ...
-      ]
-    }
   
-  OR use object detection (YOLO):
+  Single image:
     {
       "image_url": "https://example.com/image.jpg",
       "use_detection": true,
-      "confidence_threshold": 0.5
+      "detect_windows_only": true
+    }
+  
+  Multiple images:
+    {
+      "image_urls": [
+        "https://example.com/image1.jpg",
+        "https://example.com/image2.jpg"
+      ],
+      "use_detection": true,
+      "detect_windows_only": true
+    }
+  
+  Manual bounding boxes:
+    {
+      "image_url": "https://example.com/image.jpg",
+      "bounding_boxes": [
+        {"x": 100, "y": 100, "width": 200, "height": 200, "label": "object1"}
+      ]
     }
 """
 
@@ -58,12 +68,22 @@ class BoundingBox(BaseModel):
 
 
 class CropRequest(BaseModel):
-    image_url: HttpUrl
+    image_url: Optional[HttpUrl] = None  # Single image URL (for backward compatibility)
+    image_urls: Optional[List[HttpUrl]] = None  # Multiple image URLs
     bounding_boxes: Optional[List[BoundingBox]] = None
     use_detection: bool = False
     detect_windows_only: bool = False
     confidence_threshold: float = 0.5
     clear_previous: bool = True  # Delete previous cropped images before processing
+    
+    def get_image_urls(self) -> List[str]:
+        """Get list of image URLs from either image_url or image_urls field."""
+        if self.image_urls:
+            return [str(url) for url in self.image_urls]
+        elif self.image_url:
+            return [str(self.image_url)]
+        else:
+            raise ValueError("Either image_url or image_urls must be provided")
 
 
 def download_image(url: str) -> Image.Image:
@@ -312,38 +332,24 @@ def remove_overlapping_boxes(boxes: List[BoundingBox], overlap_threshold: float 
     return filtered
 
 
-@app.post("/crop-image")
-async def crop_image(request: CropRequest = Body(...)) -> JSONResponse:
-    """Crop bounding boxes from an image URL. Detects and crops all windows if requested."""
-    
-    # Clear previous cropped images if requested
-    if request.clear_previous:
-        try:
-            if OUTPUT_DIR.exists():
-                for item in OUTPUT_DIR.iterdir():
-                    if item.is_dir():
-                        shutil.rmtree(item)
-                    elif item.is_file():
-                        item.unlink()
-        except Exception as e:
-            # Log but don't fail if cleanup fails
-            pass
+def process_single_image(
+    image_url: str,
+    request: CropRequest,
+    job_dir: Path,
+    image_index: int = 0
+) -> tuple[List[Dict[str, Any]], List[str]]:
+    """Process a single image and return saved files and errors."""
+    saved_files: List[Dict[str, Any]] = []
+    errors: List[str] = []
     
     # Download image
     try:
-        image = download_image(str(request.image_url))
+        image = download_image(image_url)
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to process image: {e}")
-    
-    job_id = uuid.uuid4().hex
-    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    job_dir = OUTPUT_DIR / f"{ts}_{job_id}"
-    job_dir.mkdir(parents=True, exist_ok=True)
-    
-    saved_files: List[Dict[str, Any]] = []
-    errors: List[str] = []
+        errors.append(f"Failed to download image {image_index + 1} ({image_url}): {e}")
+        return saved_files, errors
     
     # Get bounding boxes
     bounding_boxes = request.bounding_boxes
@@ -356,24 +362,19 @@ async def crop_image(request: CropRequest = Body(...)) -> JSONResponse:
                 windows_only=request.detect_windows_only
             )
             if not bounding_boxes:
-                return JSONResponse({
-                    "status": "success",
-                    "job_id": job_id,
-                    "message": "No objects detected" + (" (no windows found)" if request.detect_windows_only else ""),
-                    "saved_count": 0,
-                    "saved_files": [],
-                    "errors": []
-                })
+                errors.append(f"No objects detected in image {image_index + 1}" + (" (no windows found)" if request.detect_windows_only else ""))
+                return saved_files, errors
         except HTTPException:
             raise
         except Exception as e:
-            errors.append(f"Detection failed: {e}")
+            errors.append(f"Detection failed for image {image_index + 1}: {e}")
             if not request.bounding_boxes:
-                raise HTTPException(status_code=500, detail=f"Detection failed and no manual boxes provided: {e}")
+                return saved_files, errors
             bounding_boxes = request.bounding_boxes
     
     if not bounding_boxes:
-        raise HTTPException(status_code=400, detail="No bounding boxes provided and detection not enabled")
+        errors.append(f"No bounding boxes provided for image {image_index + 1} and detection not enabled")
+        return saved_files, errors
     
     # Crop each bounding box (all windows will be cropped)
     window_count = 0
@@ -389,7 +390,11 @@ async def crop_image(request: CropRequest = Body(...)) -> JSONResponse:
             
             # Sanitize label for filename
             safe_label = "".join(c if c.isalnum() or c in ('-', '_') else '_' for c in label)
-            filename = f"{idx+1:03d}_{safe_label}.jpg"
+            # Include image index in filename if processing multiple images
+            if image_index > 0:
+                filename = f"img{image_index+1}_{idx+1:03d}_{safe_label}.jpg"
+            else:
+                filename = f"{idx+1:03d}_{safe_label}.jpg"
             out_path = job_dir / filename
             
             # Save cropped image to bytes
@@ -398,17 +403,26 @@ async def crop_image(request: CropRequest = Body(...)) -> JSONResponse:
             img_bytes.seek(0)
             
             # Upload to cloud storage and get URL
-            image_url = upload_to_cloud_storage(img_bytes, filename)
+            image_url_result = upload_to_cloud_storage(img_bytes, filename)
             
-            # Also save locally for backup
-            out_path = job_dir / filename
-            cropped.save(out_path.as_posix(), "JPEG", quality=95)
+            # Also save locally for backup (optional - may fail on some platforms)
+            try:
+                # Ensure directory exists
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                # Save using string path (more reliable on Render)
+                cropped.save(str(out_path), "JPEG", quality=95)
+            except Exception as save_error:
+                # If local save fails, continue anyway (cloud storage is primary)
+                # Log the error but don't fail the request
+                pass
             
             saved_files.append({
-                "url": image_url,
+                "url": image_url_result,
                 "path": str(out_path),
                 "filename": filename,
                 "label": label,
+                "source_image": image_url,
+                "image_index": image_index + 1,
                 "bbox": {
                     "x": bbox.x,
                     "y": bbox.y,
@@ -417,15 +431,61 @@ async def crop_image(request: CropRequest = Body(...)) -> JSONResponse:
                 }
             })
         except Exception as e:
-            errors.append(f"Failed to crop box {idx+1}: {e}")
+            errors.append(f"Failed to crop box {idx+1} from image {image_index + 1}: {e}")
+    
+    return saved_files, errors
+
+
+@app.post("/crop-image")
+async def crop_image(request: CropRequest = Body(...)) -> JSONResponse:
+    """Crop bounding boxes from one or more image URLs. Detects and crops all windows if requested."""
+    
+    # Validate input
+    try:
+        image_urls = request.get_image_urls()
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    
+    # Clear previous cropped images if requested
+    if request.clear_previous:
+        try:
+            if OUTPUT_DIR.exists():
+                for item in OUTPUT_DIR.iterdir():
+                    if item.is_dir():
+                        shutil.rmtree(item)
+                    elif item.is_file():
+                        item.unlink()
+        except Exception as e:
+            # Log but don't fail if cleanup fails
+            pass
+    
+    job_id = uuid.uuid4().hex
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    job_dir = OUTPUT_DIR / f"{ts}_{job_id}"
+    job_dir.mkdir(parents=True, exist_ok=True)
+    
+    all_saved_files: List[Dict[str, Any]] = []
+    all_errors: List[str] = []
+    
+    # Process each image
+    for idx, image_url in enumerate(image_urls):
+        try:
+            saved_files, errors = process_single_image(image_url, request, job_dir, image_index=idx)
+            all_saved_files.extend(saved_files)
+            all_errors.extend(errors)
+        except HTTPException:
+            raise
+        except Exception as e:
+            all_errors.append(f"Failed to process image {idx + 1} ({image_url}): {e}")
     
     return JSONResponse({
         "status": "success",
         "job_id": job_id,
         "output_dir": str(job_dir),
-        "saved_count": len(saved_files),
-        "saved_files": saved_files,
-        "errors": errors,
+        "images_processed": len(image_urls),
+        "saved_count": len(all_saved_files),
+        "saved_files": all_saved_files,
+        "errors": all_errors,
     })
 
 
@@ -434,6 +494,21 @@ async def root():
     return {
         "message": "Image to Image Generator API",
         "endpoints": {
-            "POST /crop-image": "Crop bounding boxes from an image URL"
+            "POST /crop-image": "Crop bounding boxes from one or more image URLs. Supports single image_url or multiple image_urls."
+        },
+        "usage": {
+            "single_image": {
+                "image_url": "https://example.com/image.jpg",
+                "use_detection": True,
+                "detect_windows_only": True
+            },
+            "multiple_images": {
+                "image_urls": [
+                    "https://example.com/image1.jpg",
+                    "https://example.com/image2.jpg"
+                ],
+                "use_detection": True,
+                "detect_windows_only": True
+            }
         }
     }
