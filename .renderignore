@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+cropped_images/
+server.log
+yolov8n.pt
+.vercel/
+api/
+vercel.json
+*.md
+.env
+.venv/
+venv/

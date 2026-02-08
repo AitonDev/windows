@@ -1,0 +1,5 @@
+cropped_images/
+__pycache__/
+*.pyc
+server.log
+yolov8n.pt
