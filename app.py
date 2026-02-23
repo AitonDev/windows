@@ -39,6 +39,7 @@ API Usage:
 """
 
 import os
+import time
 import uuid
 import io
 import shutil
@@ -58,6 +59,11 @@ app = FastAPI(title="Image to Image Generator", version="1.1.0")
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "./cropped_images")).resolve()
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+# Storage: set SAVE_LOCAL=false to avoid writing to server disk (use cloud only). Saves Render/ephemeral disk.
+SAVE_LOCAL = os.getenv("SAVE_LOCAL", "true").lower() in ("1", "true", "yes")
+# Cleanup: delete job dirs older than this many minutes (0 = disable). Keeps disk from growing.
+CROP_JOB_MAX_AGE_MINUTES = int(os.getenv("CROP_JOB_MAX_AGE_MINUTES", "60"))
+
 
 class BoundingBox(BaseModel):
     x: int
@@ -71,8 +77,8 @@ class CropRequest(BaseModel):
     image_url: Optional[HttpUrl] = None  # Single image URL (for backward compatibility)
     image_urls: Optional[List[HttpUrl]] = None  # Multiple image URLs
     bounding_boxes: Optional[List[BoundingBox]] = None
-    use_detection: bool = False
-    detect_windows_only: bool = False
+    use_detection: bool = True   # Automatic detection by default
+    detect_windows_only: bool = True  # Detect windows only by default
     confidence_threshold: float = 0.5
     clear_previous: bool = True  # Delete previous cropped images before processing
     
@@ -114,28 +120,37 @@ def crop_bounding_box(image: Image.Image, bbox: BoundingBox) -> Image.Image:
     return image.crop((x, y, x + width, y + height))
 
 
+def _detection_available() -> bool:
+    """Check if heavy detection libs are installed (for light-build messaging)."""
+    try:
+        from ultralytics import YOLO  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 def detect_objects(image: Image.Image, confidence_threshold: float = 0.5, windows_only: bool = False) -> List[BoundingBox]:
     """
     Detect objects in image using YOLO or advanced window detection.
     If windows_only=True, uses advanced image processing to detect window frames.
+    In light builds (requirements-light.txt), detection is unavailable; send bounding_boxes instead.
     """
-    # If windows_only, use advanced detection first
+    # If windows_only, try OpenCV-based detection first (skipped if cv2 not installed)
     if windows_only:
         bounding_boxes = detect_windows_advanced(image, confidence_threshold)
-        # If advanced detection found windows, return them
         if bounding_boxes:
             return bounding_boxes
-        # Otherwise, fall back to YOLO with filtering
-    
+        # Fall through to YOLO if available
+
     try:
         from ultralytics import YOLO
-        
+
         # Load a pretrained YOLO model
         model = YOLO("yolov8n.pt")  # nano model for speed
-        
+
         # Run inference
         results = model(image, conf=confidence_threshold)
-        
+
         bounding_boxes = []
         for result in results:
             boxes = result.boxes
@@ -146,22 +161,21 @@ def detect_objects(image: Image.Image, confidence_threshold: float = 0.5, window
                 y = int(y1)
                 width = int(x2 - x1)
                 height = int(y2 - y1)
-                
+
                 # Get class label
                 cls = int(box.cls[0])
                 label = model.names[cls]
-                
+
                 # If windows_only, filter for rectangular objects that could be windows
                 if windows_only:
                     aspect_ratio = width / height if height > 0 else 0
                     area = width * height
                     img_area = image.width * image.height
-                    
+
                     # Filter for rectangular objects that could be windows
-                    # Windows are typically rectangular and medium to large
-                    if (0.3 <= aspect_ratio <= 3.0 and  # More flexible aspect ratio
-                        area > img_area * 0.005 and      # At least 0.5% of image (smaller threshold)
-                        area < img_area * 0.9):          # But not more than 90%
+                    if (0.3 <= aspect_ratio <= 3.0 and
+                        area > img_area * 0.005 and
+                        area < img_area * 0.9):
                         bounding_boxes.append(BoundingBox(
                             x=x, y=y, width=width, height=height, label="window"
                         ))
@@ -169,12 +183,15 @@ def detect_objects(image: Image.Image, confidence_threshold: float = 0.5, window
                     bounding_boxes.append(BoundingBox(
                         x=x, y=y, width=width, height=height, label=label
                     ))
-        
+
         return bounding_boxes
     except ImportError:
         raise HTTPException(
             status_code=400,
-            detail="YOLO not installed. Install with: pip install ultralytics"
+            detail=(
+                "Object detection is not available in this build (light/free-tier). "
+                "Use manual bounding_boxes in your request, or deploy with full requirements.txt for detection."
+            )
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Object detection failed: {e}")
@@ -405,16 +422,13 @@ def process_single_image(
             # Upload to cloud storage and get URL
             image_url_result = upload_to_cloud_storage(img_bytes, filename)
             
-            # Also save locally for backup (optional - may fail on some platforms)
-            try:
-                # Ensure directory exists
-                out_path.parent.mkdir(parents=True, exist_ok=True)
-                # Save using string path (more reliable on Render)
-                cropped.save(str(out_path), "JPEG", quality=95)
-            except Exception as save_error:
-                # If local save fails, continue anyway (cloud storage is primary)
-                # Log the error but don't fail the request
-                pass
+            # Optionally save locally (set SAVE_LOCAL=false to avoid filling server disk)
+            if SAVE_LOCAL:
+                try:
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    cropped.save(str(out_path), "JPEG", quality=95)
+                except Exception:
+                    pass
             
             saved_files.append({
                 "url": image_url_result,
@@ -459,10 +473,19 @@ async def crop_image(request: CropRequest = Body(...)) -> JSONResponse:
                         shutil.rmtree(item)
                     elif item.is_file():
                         item.unlink()
-        except Exception as e:
-            # Log but don't fail if cleanup fails
+        except Exception:
             pass
-    
+
+    # Cleanup old job dirs to prevent disk from growing (CROP_JOB_MAX_AGE_MINUTES)
+    if CROP_JOB_MAX_AGE_MINUTES > 0 and OUTPUT_DIR.exists():
+        try:
+            cutoff = time.time() - (CROP_JOB_MAX_AGE_MINUTES * 60)
+            for item in OUTPUT_DIR.iterdir():
+                if item.is_dir() and item.stat().st_mtime < cutoff:
+                    shutil.rmtree(item, ignore_errors=True)
+        except Exception:
+            pass
+
     job_id = uuid.uuid4().hex
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     job_dir = OUTPUT_DIR / f"{ts}_{job_id}"
@@ -495,24 +518,28 @@ async def crop_image(request: CropRequest = Body(...)) -> JSONResponse:
 
 @app.get("/")
 async def root():
+    detection_available = _detection_available()
     return {
         "message": "Image to Image Generator API",
+        "build": "light" if not detection_available else "full",
+        "detection_available": detection_available,
         "endpoints": {
             "POST /crop-image": "Crop bounding boxes from one or more image URLs. Supports single image_url or multiple image_urls."
         },
         "usage": {
             "single_image": {
                 "image_url": "https://example.com/image.jpg",
-                "use_detection": True,
-                "detect_windows_only": True
+                "use_detection": detection_available,
+                "detect_windows_only": detection_available,
+                "bounding_boxes": "Optional; required if use_detection is false (light build)"
             },
             "multiple_images": {
                 "image_urls": [
                     "https://example.com/image1.jpg",
                     "https://example.com/image2.jpg"
                 ],
-                "use_detection": True,
-                "detect_windows_only": True
+                "use_detection": detection_available,
+                "detect_windows_only": detection_available
             }
         }
     }

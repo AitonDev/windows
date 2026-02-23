@@ -1,0 +1,10 @@
+# Light stack for free tier (Render, etc.): crop by manual bounding_boxes only.
+# No object/window detection (no ultralytics, opencv).
+fastapi
+uvicorn[standard]
+python-multipart
+pillow
+requests
+pydantic
+# Optional: uncomment if you use Cloudinary for image URLs
+# cloudinary

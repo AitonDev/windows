@@ -1,18 +1,23 @@
+# Automatic detection requires full requirements (YOLO + OpenCV). Free tier may be slow; starter recommended.
 services:
   - type: web
     name: windows-api
     env: python
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
-    plan: starter  # or free for free tier
+    plan: starter
     envVars:
       - key: OUTPUT_DIR
         value: ./cropped_images
+      - key: SAVE_LOCAL
+        value: "false"   # Don't fill Render disk; use cloud storage (ImgBB/Cloudinary)
+      - key: CROP_JOB_MAX_AGE_MINUTES
+        value: "60"      # Delete local job dirs older than 60 min (if any)
       - key: IMGBB_API_KEY
-        sync: false  # Set this in Render dashboard
+        sync: false  # Set in Render dashboard for image hosting
       - key: CLOUDINARY_CLOUD_NAME
-        sync: false  # Optional: Set if using Cloudinary
+        sync: false  # Optional: Cloudinary
       - key: CLOUDINARY_API_KEY
-        sync: false  # Optional: Set if using Cloudinary
+        sync: false
       - key: CLOUDINARY_API_SECRET
-        sync: false  # Optional: Set if using Cloudinary
+        sync: false
