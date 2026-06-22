@@ -258,11 +258,9 @@ def detect_objects_with_retries(
     """
     attempts: List[str] = []
     boxes = detect_objects(image, confidence_threshold, windows_only=windows_only)
-    if boxes and (not windows_only or len(boxes) > 1):
+    if boxes:
         attempts.append(f"detected {len(boxes)} at threshold {confidence_threshold}")
         return boxes, attempts
-    if boxes:
-        attempts.append(f"detected {len(boxes)} at threshold {confidence_threshold}; checking for missed drawings")
 
     retry_threshold = max(0.25, confidence_threshold - 0.05)
     retry_used = confidence_threshold
@@ -270,13 +268,10 @@ def detect_objects_with_retries(
         attempts.append(f"retrying at {retry_threshold:.2f}")
         retry_boxes = detect_objects(image, retry_threshold, windows_only=windows_only)
         retry_used = retry_threshold
-        if len(retry_boxes) > len(boxes):
+        if retry_boxes:
             boxes = retry_boxes
-        if boxes and (not windows_only or len(boxes) > 1):
             attempts.append(f"detected {len(boxes)} at threshold {retry_threshold:.2f}")
             return boxes, attempts
-        if boxes:
-            attempts.append(f"best threshold retry still found {len(boxes)}")
 
     if max(image.width, image.height) < 2000:
         scale = 1.5
@@ -294,15 +289,8 @@ def detect_objects_with_retries(
                 )
                 for box in upscale_boxes
             ]
-            if len(scaled_boxes) > len(boxes):
-                boxes = scaled_boxes
-            if boxes and (not windows_only or len(boxes) > 1):
-                attempts.append(f"detected {len(boxes)} after upscale retry")
-                return boxes, attempts
-
-    if boxes:
-        attempts.append(f"returning best effort with {len(boxes)} detections")
-        return boxes, attempts
+            attempts.append(f"detected {len(scaled_boxes)} after upscale retry")
+            return scaled_boxes, attempts
 
     attempts.append("no detection after all attempts")
     return [], attempts
@@ -361,9 +349,6 @@ def detect_windows_advanced(image: Image.Image, confidence_threshold: float = 0.
         
         # Remove overlapping/duplicate boxes
         bounding_boxes = remove_overlapping_boxes(bounding_boxes, overlap_threshold=0.5)
-
-        if len(bounding_boxes) >= 2:
-            return bounding_boxes
 
         drawing_boxes = detect_pdf_window_drawings(img_array)
         if drawing_boxes:
