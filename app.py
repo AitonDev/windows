@@ -264,7 +264,7 @@ def detect_objects_with_retries(
     if boxes:
         attempts.append(f"detected {len(boxes)} at threshold {confidence_threshold}; checking for missed drawings")
 
-    retry_threshold = max(0.15, min(confidence_threshold * 0.6, confidence_threshold - 0.05))
+    retry_threshold = max(0.25, confidence_threshold - 0.05)
     retry_used = confidence_threshold
     if retry_threshold < confidence_threshold:
         attempts.append(f"retrying at {retry_threshold:.2f}")
@@ -319,9 +319,6 @@ def detect_windows_advanced(image: Image.Image, confidence_threshold: float = 0.
         
         # Convert PIL to OpenCV format
         img_array = np.array(image)
-        drawing_boxes = detect_pdf_window_drawings(img_array)
-        if drawing_boxes:
-            return drawing_boxes
 
         img_cv = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
         gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
@@ -364,6 +361,13 @@ def detect_windows_advanced(image: Image.Image, confidence_threshold: float = 0.
         
         # Remove overlapping/duplicate boxes
         bounding_boxes = remove_overlapping_boxes(bounding_boxes, overlap_threshold=0.5)
+
+        if len(bounding_boxes) >= 2:
+            return bounding_boxes
+
+        drawing_boxes = detect_pdf_window_drawings(img_array)
+        if drawing_boxes:
+            return add_missing_boxes(bounding_boxes, drawing_boxes)
         
         return bounding_boxes
     except ImportError:
@@ -391,8 +395,10 @@ def detect_pdf_window_drawings(img_array) -> List[BoundingBox]:
         mask = (
             (blue > 140) &
             (green > 140) &
-            (red < 245) &
-            ((blue - red > 8) | (green - red > 8))
+            (red < 235) &
+            (blue >= green - 20) &
+            (blue - red > 12) &
+            (green - red > 12)
         ).astype(np.uint8) * 255
 
         kernel = np.ones((5, 5), np.uint8)
@@ -404,6 +410,8 @@ def detect_pdf_window_drawings(img_array) -> List[BoundingBox]:
         for contour in contours:
             x, y, w, h = cv2.boundingRect(contour)
             area = w * h
+            if y < height * 0.06:
+                continue
             if area < 400:
                 continue
             if w < 12 or h < 20:
@@ -463,6 +471,46 @@ def merge_nearby_rects(rects: List[tuple[int, int, int, int]], margin: int = 25)
     if len(merged) == len(rects):
         return merged
     return merge_nearby_rects(merged, margin=margin)
+
+
+def add_missing_boxes(primary: List[BoundingBox], supplemental: List[BoundingBox]) -> List[BoundingBox]:
+    """Keep the original contour boxes and add only non-overlapping supplemental boxes."""
+    combined = list(primary)
+    for box in supplemental:
+        if any(boxes_refer_to_same_target(existing, box) for existing in combined):
+            continue
+        combined.append(box)
+    combined = remove_overlapping_boxes(combined, overlap_threshold=0.5)
+    combined.sort(key=lambda candidate: (candidate.y, candidate.x))
+    return combined
+
+
+def boxes_refer_to_same_target(first: BoundingBox, second: BoundingBox) -> bool:
+    """Treat boxes as the same crop if their centers or visible areas strongly overlap."""
+    first_center = (first.x + first.width / 2, first.y + first.height / 2)
+    second_center = (second.x + second.width / 2, second.y + second.height / 2)
+
+    if (
+        first.x <= second_center[0] <= first.x + first.width and
+        first.y <= second_center[1] <= first.y + first.height
+    ):
+        return True
+    if (
+        second.x <= first_center[0] <= second.x + second.width and
+        second.y <= first_center[1] <= second.y + second.height
+    ):
+        return True
+
+    x1 = max(first.x, second.x)
+    y1 = max(first.y, second.y)
+    x2 = min(first.x + first.width, second.x + second.width)
+    y2 = min(first.y + first.height, second.y + second.height)
+    if x2 <= x1 or y2 <= y1:
+        return False
+
+    intersection = (x2 - x1) * (y2 - y1)
+    smaller_area = min(first.width * first.height, second.width * second.height)
+    return smaller_area > 0 and intersection / smaller_area > 0.35
 
 
 def upload_to_cloud_storage(img_bytes: io.BytesIO, filename: str) -> str:
