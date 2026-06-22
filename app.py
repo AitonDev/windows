@@ -63,6 +63,7 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 SAVE_LOCAL = os.getenv("SAVE_LOCAL", "true").lower() in ("1", "true", "yes")
 # Cleanup: delete job dirs older than this many minutes (0 = disable). Keeps disk from growing.
 CROP_JOB_MAX_AGE_MINUTES = int(os.getenv("CROP_JOB_MAX_AGE_MINUTES", "60"))
+YOLO_MODEL = None
 
 
 class BoundingBox(BaseModel):
@@ -80,7 +81,13 @@ class CropRequest(BaseModel):
     use_detection: bool = True   # Automatic detection by default
     detect_windows_only: bool = True  # Detect windows only by default
     confidence_threshold: float = 0.5
-    clear_previous: bool = True  # Delete previous cropped images before processing
+    clear_previous: bool = False  # Looped PDF processing should not delete previous results by default
+    batch_id: Optional[str] = None
+    pdf_id: Optional[str] = None
+    pdf_name: Optional[str] = None
+    page_number: Optional[int] = None
+    source_image_index: Optional[int] = None
+    source_label: Optional[str] = None
     
     def get_image_urls(self) -> List[str]:
         """Get list of image URLs from either image_url or image_urls field."""
@@ -120,6 +127,43 @@ def crop_bounding_box(image: Image.Image, bbox: BoundingBox) -> Image.Image:
     return image.crop((x, y, x + width, y + height))
 
 
+def _safe_token(value: Optional[Any], fallback: str) -> str:
+    """Create a compact filename-safe token for source labels."""
+    raw = str(value).strip() if value is not None else fallback
+    token = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in raw)
+    return token or fallback
+
+
+def build_source_metadata(request: CropRequest, image_url: str, image_index: int) -> Dict[str, Any]:
+    """Return the source identity that follows every crop and no-detection result."""
+    source_position = request.source_image_index or image_index + 1
+    return {
+        "batch_id": request.batch_id,
+        "pdf_id": request.pdf_id,
+        "pdf_name": request.pdf_name,
+        "page_number": request.page_number,
+        "source_image_index": source_position,
+        "source_label": request.source_label,
+        "source_image": image_url,
+        "request_image_index": image_index + 1,
+    }
+
+
+def build_filename_prefix(source: Dict[str, Any]) -> str:
+    """Make crop filenames understandable when images are processed one request at a time."""
+    parts = []
+    if source.get("batch_id"):
+        parts.append(f"batch_{_safe_token(source.get('batch_id'), 'batch')}")
+    if source.get("pdf_id"):
+        parts.append(f"pdf_{_safe_token(source.get('pdf_id'), 'pdf')}")
+    if source.get("page_number") is not None:
+        parts.append(f"page_{int(source['page_number']):03d}")
+    parts.append(f"image_{int(source.get('source_image_index') or 1):03d}")
+    if source.get("source_label"):
+        parts.append(_safe_token(source.get("source_label"), "source"))
+    return "_".join(parts)
+
+
 def _detection_available() -> bool:
     """Check if heavy detection libs are installed (for light-build messaging)."""
     try:
@@ -127,6 +171,15 @@ def _detection_available() -> bool:
         return True
     except ImportError:
         return False
+
+
+def get_yolo_model():
+    """Load YOLO once per process so retry passes do not repeatedly initialize it."""
+    global YOLO_MODEL
+    if YOLO_MODEL is None:
+        from ultralytics import YOLO
+        YOLO_MODEL = YOLO("yolov8n.pt")  # nano model for speed
+    return YOLO_MODEL
 
 
 def detect_objects(image: Image.Image, confidence_threshold: float = 0.5, windows_only: bool = False) -> List[BoundingBox]:
@@ -143,10 +196,7 @@ def detect_objects(image: Image.Image, confidence_threshold: float = 0.5, window
         # Fall through to YOLO if available
 
     try:
-        from ultralytics import YOLO
-
-        # Load a pretrained YOLO model
-        model = YOLO("yolov8n.pt")  # nano model for speed
+        model = get_yolo_model()
 
         # Run inference
         results = model(image, conf=confidence_threshold)
@@ -195,6 +245,54 @@ def detect_objects(image: Image.Image, confidence_threshold: float = 0.5, window
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Object detection failed: {e}")
+
+
+def detect_objects_with_retries(
+    image: Image.Image,
+    confidence_threshold: float = 0.5,
+    windows_only: bool = False
+) -> tuple[List[BoundingBox], List[str]]:
+    """
+    Try a small number of detection passes before declaring a miss.
+    This keeps looped PDF processing simple while reducing false negatives.
+    """
+    attempts: List[str] = []
+    boxes = detect_objects(image, confidence_threshold, windows_only=windows_only)
+    if boxes:
+        attempts.append(f"detected at threshold {confidence_threshold}")
+        return boxes, attempts
+
+    retry_threshold = max(0.15, min(confidence_threshold * 0.6, confidence_threshold - 0.05))
+    retry_used = confidence_threshold
+    if retry_threshold < confidence_threshold:
+        attempts.append(f"no detection at threshold {confidence_threshold}; retrying at {retry_threshold:.2f}")
+        boxes = detect_objects(image, retry_threshold, windows_only=windows_only)
+        retry_used = retry_threshold
+        if boxes:
+            attempts.append(f"detected at threshold {retry_threshold:.2f}")
+            return boxes, attempts
+
+    if max(image.width, image.height) < 2000:
+        scale = 1.5
+        attempts.append(f"no detection after threshold retry; retrying with {scale}x upscale")
+        upscaled = image.resize((int(image.width * scale), int(image.height * scale)))
+        boxes = detect_objects(upscaled, retry_used, windows_only=windows_only)
+        if boxes:
+            scaled_boxes = [
+                BoundingBox(
+                    x=int(box.x / scale),
+                    y=int(box.y / scale),
+                    width=int(box.width / scale),
+                    height=int(box.height / scale),
+                    label=box.label,
+                )
+                for box in boxes
+            ]
+            attempts.append("detected after upscale retry")
+            return scaled_boxes, attempts
+
+    attempts.append("no detection after all attempts")
+    return [], attempts
 
 
 def detect_windows_advanced(image: Image.Image, confidence_threshold: float = 0.5) -> List[BoundingBox]:
@@ -354,10 +452,19 @@ def process_single_image(
     request: CropRequest,
     job_dir: Path,
     image_index: int = 0
-) -> tuple[List[Dict[str, Any]], List[str]]:
-    """Process a single image and return saved files and errors."""
+) -> tuple[List[Dict[str, Any]], List[str], Dict[str, Any]]:
+    """Process a single image and return saved files, errors, and a source-level status."""
     saved_files: List[Dict[str, Any]] = []
     errors: List[str] = []
+    source = build_source_metadata(request, image_url, image_index)
+    source_item: Dict[str, Any] = {
+        **source,
+        "status": "processing",
+        "saved_count": 0,
+        "crops": [],
+        "errors": [],
+        "detection_attempts": [],
+    }
     
     # Download image
     try:
@@ -365,33 +472,46 @@ def process_single_image(
     except HTTPException:
         raise
     except Exception as e:
-        errors.append(f"Failed to download image {image_index + 1} ({image_url}): {e}")
-        return saved_files, errors
+        message = f"Failed to download image {image_index + 1} ({image_url}): {e}"
+        errors.append(message)
+        source_item["status"] = "failed"
+        source_item["errors"].append(message)
+        return saved_files, errors, source_item
     
     # Get bounding boxes
     bounding_boxes = request.bounding_boxes
     
     if request.use_detection:
         try:
-            bounding_boxes = detect_objects(
+            bounding_boxes, detection_attempts = detect_objects_with_retries(
                 image, 
                 request.confidence_threshold,
                 windows_only=request.detect_windows_only
             )
+            source_item["detection_attempts"] = detection_attempts
             if not bounding_boxes:
-                errors.append(f"No objects detected in image {image_index + 1}" + (" (no windows found)" if request.detect_windows_only else ""))
-                return saved_files, errors
+                message = f"No objects detected in image {image_index + 1}" + (" (no windows found)" if request.detect_windows_only else "")
+                errors.append(message)
+                source_item["status"] = "no_detection"
+                source_item["errors"].append(message)
+                return saved_files, errors, source_item
         except HTTPException:
             raise
         except Exception as e:
-            errors.append(f"Detection failed for image {image_index + 1}: {e}")
+            message = f"Detection failed for image {image_index + 1}: {e}"
+            errors.append(message)
+            source_item["errors"].append(message)
             if not request.bounding_boxes:
-                return saved_files, errors
+                source_item["status"] = "failed"
+                return saved_files, errors, source_item
             bounding_boxes = request.bounding_boxes
     
     if not bounding_boxes:
-        errors.append(f"No bounding boxes provided for image {image_index + 1} and detection not enabled")
-        return saved_files, errors
+        message = f"No bounding boxes provided for image {image_index + 1} and detection not enabled"
+        errors.append(message)
+        source_item["status"] = "failed"
+        source_item["errors"].append(message)
+        return saved_files, errors, source_item
     
     # Crop each bounding box (all windows will be cropped)
     window_count = 0
@@ -407,11 +527,8 @@ def process_single_image(
             
             # Sanitize label for filename
             safe_label = "".join(c if c.isalnum() or c in ('-', '_') else '_' for c in label)
-            # Include image index in filename if processing multiple images
-            if image_index > 0:
-                filename = f"img{image_index+1}_{idx+1:03d}_{safe_label}.jpg"
-            else:
-                filename = f"{idx+1:03d}_{safe_label}.jpg"
+            filename_prefix = build_filename_prefix(source)
+            filename = f"{filename_prefix}_crop_{idx+1:03d}_{safe_label}.jpg"
             out_path = job_dir / filename
             
             # Save cropped image to bytes
@@ -430,13 +547,12 @@ def process_single_image(
                 except Exception:
                     pass
             
-            saved_files.append({
+            crop_info = {
                 "url": image_url_result,
                 "path": str(out_path),
                 "filename": filename,
                 "label": label,
-                "source_image": image_url,
-                "image_index": image_index + 1,
+                **source,
                 "dimensions": {
                     "width": cropped.width,
                     "height": cropped.height
@@ -447,11 +563,17 @@ def process_single_image(
                     "width": bbox.width,
                     "height": bbox.height
                 }
-            })
+            }
+            saved_files.append(crop_info)
+            source_item["crops"].append(crop_info)
         except Exception as e:
-            errors.append(f"Failed to crop box {idx+1} from image {image_index + 1}: {e}")
+            message = f"Failed to crop box {idx+1} from image {image_index + 1}: {e}"
+            errors.append(message)
+            source_item["errors"].append(message)
     
-    return saved_files, errors
+    source_item["saved_count"] = len(saved_files)
+    source_item["status"] = "success" if saved_files else "failed"
+    return saved_files, errors, source_item
 
 
 @app.post("/crop-image")
@@ -493,25 +615,39 @@ async def crop_image(request: CropRequest = Body(...)) -> JSONResponse:
     
     all_saved_files: List[Dict[str, Any]] = []
     all_errors: List[str] = []
+    source_items: List[Dict[str, Any]] = []
     
     # Process each image
     for idx, image_url in enumerate(image_urls):
         try:
-            saved_files, errors = process_single_image(image_url, request, job_dir, image_index=idx)
+            saved_files, errors, source_item = process_single_image(image_url, request, job_dir, image_index=idx)
             all_saved_files.extend(saved_files)
             all_errors.extend(errors)
+            source_items.append(source_item)
         except HTTPException:
             raise
         except Exception as e:
-            all_errors.append(f"Failed to process image {idx + 1} ({image_url}): {e}")
+            message = f"Failed to process image {idx + 1} ({image_url}): {e}"
+            all_errors.append(message)
+            source = build_source_metadata(request, image_url, idx)
+            source_items.append({
+                **source,
+                "status": "failed",
+                "saved_count": 0,
+                "crops": [],
+                "errors": [message],
+                "detection_attempts": [],
+            })
     
     return JSONResponse({
         "status": "success",
         "job_id": job_id,
+        "batch_id": request.batch_id or job_id,
         "output_dir": str(job_dir),
         "images_processed": len(image_urls),
         "saved_count": len(all_saved_files),
         "saved_files": all_saved_files,
+        "source_items": source_items,
         "errors": all_errors,
     })
 
