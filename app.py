@@ -258,26 +258,32 @@ def detect_objects_with_retries(
     """
     attempts: List[str] = []
     boxes = detect_objects(image, confidence_threshold, windows_only=windows_only)
-    if boxes:
-        attempts.append(f"detected at threshold {confidence_threshold}")
+    if boxes and (not windows_only or len(boxes) > 1):
+        attempts.append(f"detected {len(boxes)} at threshold {confidence_threshold}")
         return boxes, attempts
+    if boxes:
+        attempts.append(f"detected {len(boxes)} at threshold {confidence_threshold}; checking for missed drawings")
 
     retry_threshold = max(0.15, min(confidence_threshold * 0.6, confidence_threshold - 0.05))
     retry_used = confidence_threshold
     if retry_threshold < confidence_threshold:
-        attempts.append(f"no detection at threshold {confidence_threshold}; retrying at {retry_threshold:.2f}")
-        boxes = detect_objects(image, retry_threshold, windows_only=windows_only)
+        attempts.append(f"retrying at {retry_threshold:.2f}")
+        retry_boxes = detect_objects(image, retry_threshold, windows_only=windows_only)
         retry_used = retry_threshold
-        if boxes:
-            attempts.append(f"detected at threshold {retry_threshold:.2f}")
+        if len(retry_boxes) > len(boxes):
+            boxes = retry_boxes
+        if boxes and (not windows_only or len(boxes) > 1):
+            attempts.append(f"detected {len(boxes)} at threshold {retry_threshold:.2f}")
             return boxes, attempts
+        if boxes:
+            attempts.append(f"best threshold retry still found {len(boxes)}")
 
     if max(image.width, image.height) < 2000:
         scale = 1.5
-        attempts.append(f"no detection after threshold retry; retrying with {scale}x upscale")
+        attempts.append(f"retrying with {scale}x upscale")
         upscaled = image.resize((int(image.width * scale), int(image.height * scale)))
-        boxes = detect_objects(upscaled, retry_used, windows_only=windows_only)
-        if boxes:
+        upscale_boxes = detect_objects(upscaled, retry_used, windows_only=windows_only)
+        if upscale_boxes:
             scaled_boxes = [
                 BoundingBox(
                     x=int(box.x / scale),
@@ -286,10 +292,17 @@ def detect_objects_with_retries(
                     height=int(box.height / scale),
                     label=box.label,
                 )
-                for box in boxes
+                for box in upscale_boxes
             ]
-            attempts.append("detected after upscale retry")
-            return scaled_boxes, attempts
+            if len(scaled_boxes) > len(boxes):
+                boxes = scaled_boxes
+            if boxes and (not windows_only or len(boxes) > 1):
+                attempts.append(f"detected {len(boxes)} after upscale retry")
+                return boxes, attempts
+
+    if boxes:
+        attempts.append(f"returning best effort with {len(boxes)} detections")
+        return boxes, attempts
 
     attempts.append("no detection after all attempts")
     return [], attempts
@@ -306,6 +319,10 @@ def detect_windows_advanced(image: Image.Image, confidence_threshold: float = 0.
         
         # Convert PIL to OpenCV format
         img_array = np.array(image)
+        drawing_boxes = detect_pdf_window_drawings(img_array)
+        if drawing_boxes:
+            return drawing_boxes
+
         img_cv = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
         gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
         
@@ -354,6 +371,98 @@ def detect_windows_advanced(image: Image.Image, confidence_threshold: float = 0.
         return []
     except Exception as e:
         return []
+
+
+def detect_pdf_window_drawings(img_array) -> List[BoundingBox]:
+    """
+    Detect light-blue product drawings in PDF-rendered quotation pages.
+    These drawings are the crop targets and are often too small for generic contour thresholds.
+    """
+    try:
+        import cv2
+        import numpy as np
+
+        height, width = img_array.shape[:2]
+        red = img_array[:, :, 0].astype(np.int16)
+        green = img_array[:, :, 1].astype(np.int16)
+        blue = img_array[:, :, 2].astype(np.int16)
+
+        # Window panes in these PDFs are pale blue/cyan; text and divider lines are not.
+        mask = (
+            (blue > 140) &
+            (green > 140) &
+            (red < 245) &
+            ((blue - red > 8) | (green - red > 8))
+        ).astype(np.uint8) * 255
+
+        kernel = np.ones((5, 5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        mask = cv2.dilate(mask, kernel, iterations=2)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        raw_boxes = []
+        for contour in contours:
+            x, y, w, h = cv2.boundingRect(contour)
+            area = w * h
+            if area < 400:
+                continue
+            if w < 12 or h < 20:
+                continue
+            if area > width * height * 0.15:
+                continue
+            raw_boxes.append((x, y, x + w, y + h))
+
+        if not raw_boxes:
+            return []
+
+        merged = merge_nearby_rects(raw_boxes, margin=35)
+        boxes = []
+        for x1, y1, x2, y2 in merged:
+            pad = 14
+            x1 = max(0, x1 - pad)
+            y1 = max(0, y1 - pad)
+            x2 = min(width, x2 + pad)
+            y2 = min(height, y2 + pad)
+            w = x2 - x1
+            h = y2 - y1
+            if w >= 20 and h >= 35:
+                boxes.append(BoundingBox(x=x1, y=y1, width=w, height=h, label="window"))
+
+        boxes.sort(key=lambda box: (box.y, box.x))
+        return remove_overlapping_boxes(boxes, overlap_threshold=0.35)
+    except Exception:
+        return []
+
+
+def merge_nearby_rects(rects: List[tuple[int, int, int, int]], margin: int = 25) -> List[tuple[int, int, int, int]]:
+    """Merge nearby drawing fragments, such as multiple panes in one product drawing."""
+    merged: List[tuple[int, int, int, int]] = []
+    for rect in rects:
+        x1, y1, x2, y2 = rect
+        did_merge = False
+        for idx, existing in enumerate(merged):
+            ex1, ey1, ex2, ey2 = existing
+            overlaps = not (
+                x2 + margin < ex1 or
+                x1 - margin > ex2 or
+                y2 + margin < ey1 or
+                y1 - margin > ey2
+            )
+            if overlaps:
+                merged[idx] = (
+                    min(x1, ex1),
+                    min(y1, ey1),
+                    max(x2, ex2),
+                    max(y2, ey2),
+                )
+                did_merge = True
+                break
+        if not did_merge:
+            merged.append(rect)
+
+    if len(merged) == len(rects):
+        return merged
+    return merge_nearby_rects(merged, margin=margin)
 
 
 def upload_to_cloud_storage(img_bytes: io.BytesIO, filename: str) -> str:
