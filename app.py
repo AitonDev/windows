@@ -46,7 +46,8 @@ import shutil
 import base64
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Literal, Tuple
+import logging
 
 import requests
 from PIL import Image
@@ -55,6 +56,10 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, HttpUrl
 
 app = FastAPI(title="Image to Image Generator", version="1.1.0")
+logger = logging.getLogger("crop_api")
+logging.basicConfig(level=logging.INFO)
+
+IMGBB_MAX_ATTEMPTS = int(os.getenv("IMGBB_MAX_ATTEMPTS", "3"))
 
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "./cropped_images")).resolve()
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -88,6 +93,9 @@ class CropRequest(BaseModel):
     page_number: Optional[int] = None
     source_image_index: Optional[int] = None
     source_label: Optional[str] = None
+    # "cloud": upload to ImgBB/Cloudinary (base64 only as a flagged last resort).
+    # "inline": skip third-party hosting and return each crop as a base64 data URL.
+    storage: Literal["cloud", "inline"] = "cloud"
     
     def get_image_urls(self) -> List[str]:
         """Get list of image URLs from either image_url or image_urls field."""
@@ -498,35 +506,53 @@ def boxes_refer_to_same_target(first: BoundingBox, second: BoundingBox) -> bool:
     return smaller_area > 0 and intersection / smaller_area > 0.35
 
 
-def upload_to_cloud_storage(img_bytes: io.BytesIO, filename: str) -> str:
-    """
-    Upload image to cloud storage and return URL.
-    Supports: ImgBB, Cloudinary, or returns base64 data URL as fallback.
-    """
+def to_data_url(img_bytes: io.BytesIO) -> str:
     img_bytes.seek(0)
-    
-    # Option 1: ImgBB (requires API key)
-    imgbb_api_key = os.getenv("IMGBB_API_KEY", "")
-    if imgbb_api_key:
+    return f"data:image/jpeg;base64,{base64.b64encode(img_bytes.read()).decode()}"
+
+
+def upload_to_imgbb(img_base64: str, filename: str, api_key: str) -> Tuple[Optional[str], Optional[str]]:
+    """Return (url, None) on success or (None, last_error) after all attempts fail."""
+    last_error = None
+    for attempt in range(1, IMGBB_MAX_ATTEMPTS + 1):
         try:
-            img_base64 = base64.b64encode(img_bytes.read()).decode()
             response = requests.post(
                 "https://api.imgbb.com/1/upload",
-                data={
-                    "key": imgbb_api_key,
-                    "image": img_base64,
-                    "name": filename
-                },
-                timeout=30
+                data={"key": api_key, "image": img_base64, "name": filename},
+                timeout=30,
             )
             if response.status_code == 200:
                 result = response.json()
                 if result.get("success"):
-                    return result["data"]["url"]
-        except Exception:
-            pass
-    
-    # Option 2: Cloudinary
+                    return result["data"]["url"], None
+                last_error = f"ImgBB success=false: {str(result)[:200]}"
+            else:
+                last_error = f"ImgBB HTTP {response.status_code}: {response.text[:200]}"
+        except Exception as e:
+            last_error = f"ImgBB error: {e}"
+        logger.warning("ImgBB upload attempt %s/%s failed for %s: %s", attempt, IMGBB_MAX_ATTEMPTS, filename, last_error)
+        if attempt < IMGBB_MAX_ATTEMPTS:
+            time.sleep(attempt)
+    return None, last_error
+
+
+def upload_to_cloud_storage(img_bytes: io.BytesIO, filename: str) -> Tuple[str, str, Optional[str]]:
+    """
+    Upload image to cloud storage.
+    Returns (url, storage, warning) where storage is "imgbb", "cloudinary" or "base64".
+    warning explains why a base64 fallback was used.
+    """
+    failures: List[str] = []
+
+    imgbb_api_key = os.getenv("IMGBB_API_KEY", "")
+    if imgbb_api_key:
+        img_bytes.seek(0)
+        img_base64 = base64.b64encode(img_bytes.read()).decode()
+        url, error = upload_to_imgbb(img_base64, filename, imgbb_api_key)
+        if url:
+            return url, "imgbb", None
+        failures.append(error or "ImgBB upload failed")
+
     cloudinary_cloud = os.getenv("CLOUDINARY_CLOUD_NAME", "")
     if cloudinary_cloud:
         try:
@@ -543,14 +569,14 @@ def upload_to_cloud_storage(img_bytes: io.BytesIO, filename: str) -> str:
                 folder="cropped-images",
                 public_id=filename.replace(".jpg", "")
             )
-            return result["secure_url"]
-        except Exception:
-            pass
-    
-    # Option 3: Return base64 data URL (works but not ideal for large images)
-    img_bytes.seek(0)
-    img_base64 = base64.b64encode(img_bytes.read()).decode()
-    return f"data:image/jpeg;base64,{img_base64}"
+            return result["secure_url"], "cloudinary", None
+        except Exception as e:
+            failures.append(f"Cloudinary error: {e}")
+            logger.warning("Cloudinary upload failed for %s: %s", filename, e)
+
+    warning = "; ".join(failures) if failures else "No cloud storage configured"
+    logger.warning("Returning base64 for %s: %s", filename, warning)
+    return to_data_url(img_bytes), "base64", warning
 
 
 def remove_overlapping_boxes(boxes: List[BoundingBox], overlap_threshold: float = 0.5) -> List[BoundingBox]:
@@ -678,8 +704,14 @@ def process_single_image(
             cropped.save(img_bytes, format="JPEG", quality=95)
             img_bytes.seek(0)
             
-            # Upload to cloud storage and get URL
-            image_url_result = upload_to_cloud_storage(img_bytes, filename)
+            if request.storage == "inline":
+                image_url_result, storage, storage_warning = to_data_url(img_bytes), "inline", None
+            else:
+                image_url_result, storage, storage_warning = upload_to_cloud_storage(img_bytes, filename)
+            if storage_warning:
+                message = f"Crop {idx+1} from image {image_index + 1} returned as base64: {storage_warning}"
+                errors.append(message)
+                source_item["errors"].append(message)
             
             # Optionally save locally (set SAVE_LOCAL=false to avoid filling server disk)
             if SAVE_LOCAL:
@@ -691,6 +723,7 @@ def process_single_image(
             
             crop_info = {
                 "url": image_url_result,
+                "storage": storage,
                 "path": str(out_path),
                 "filename": filename,
                 "label": label,

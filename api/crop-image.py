@@ -45,6 +45,7 @@ def handler(req):
             "page_number": data.get("page_number"),
             "source_image_index": data.get("source_image_index"),
             "source_label": data.get("source_label"),
+            "storage": data.get("storage", "cloud"),
         }
         if "image_url" in data:
             payload["image_url"] = data["image_url"]
