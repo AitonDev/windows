@@ -51,6 +51,8 @@ def handler(req):
             payload["image_url"] = data["image_url"]
         if "image_urls" in data:
             payload["image_urls"] = data["image_urls"]
+        if "image_base64" in data:
+            payload["image_base64"] = data["image_base64"]
         if "bounding_boxes" in data:
             payload["bounding_boxes"] = data["bounding_boxes"]
         
@@ -58,7 +60,7 @@ def handler(req):
         resp = requests.post(
             f"{PYTHON_API_URL}/crop-image",
             json=payload,
-            timeout=60
+            timeout=300
         )
         
         return {

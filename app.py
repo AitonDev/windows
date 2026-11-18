@@ -82,6 +82,8 @@ class BoundingBox(BaseModel):
 class CropRequest(BaseModel):
     image_url: Optional[HttpUrl] = None  # Single image URL (for backward compatibility)
     image_urls: Optional[List[HttpUrl]] = None  # Multiple image URLs
+    # Raw base64 or data-URL JPEG/PNG — used by Divine Quotes editor (no public URL needed).
+    image_base64: Optional[str] = None
     bounding_boxes: Optional[List[BoundingBox]] = None
     use_detection: bool = True   # Automatic detection by default
     detect_windows_only: bool = True  # Detect windows only by default
@@ -103,8 +105,10 @@ class CropRequest(BaseModel):
             return [str(url) for url in self.image_urls]
         elif self.image_url:
             return [str(self.image_url)]
+        elif self.image_base64:
+            return ["data:image/jpeg;base64"]
         else:
-            raise ValueError("Either image_url or image_urls must be provided")
+            raise ValueError("Either image_url, image_urls, or image_base64 must be provided")
 
 
 def download_image(url: str) -> Image.Image:
@@ -119,6 +123,18 @@ def download_image(url: str) -> Image.Image:
         return image
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to download image: {e}")
+
+
+def image_from_base64(data: str) -> Image.Image:
+    """Load an image from a raw base64 string or data URL."""
+    try:
+        raw = data.split(",", 1)[1] if data.startswith("data:") and "," in data else data
+        image = Image.open(io.BytesIO(base64.b64decode(raw)))
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        return image
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to decode image_base64: {e}")
 
 
 def crop_bounding_box(image: Image.Image, bbox: BoundingBox) -> Image.Image:
@@ -619,7 +635,8 @@ def process_single_image(
     image_url: str,
     request: CropRequest,
     job_dir: Path,
-    image_index: int = 0
+    image_index: int = 0,
+    preloaded_image: Optional[Image.Image] = None,
 ) -> tuple[List[Dict[str, Any]], List[str], Dict[str, Any]]:
     """Process a single image and return saved files, errors, and a source-level status."""
     saved_files: List[Dict[str, Any]] = []
@@ -634,9 +651,9 @@ def process_single_image(
         "detection_attempts": [],
     }
     
-    # Download image
+    # Load image from memory or download
     try:
-        image = download_image(image_url)
+        image = preloaded_image if preloaded_image is not None else download_image(image_url)
     except HTTPException:
         raise
     except Exception as e:
@@ -792,19 +809,26 @@ async def crop_image(request: CropRequest = Body(...)) -> JSONResponse:
     all_errors: List[str] = []
     source_items: List[Dict[str, Any]] = []
     
-    # Process each image
-    for idx, image_url in enumerate(image_urls):
+    # Process each image (URL list, or a single inlined base64 image)
+    if request.image_base64:
         try:
-            saved_files, errors, source_item = process_single_image(image_url, request, job_dir, image_index=idx)
+            preloaded = image_from_base64(request.image_base64)
+            saved_files, errors, source_item = process_single_image(
+                "inline://upload",
+                request,
+                job_dir,
+                image_index=0,
+                preloaded_image=preloaded,
+            )
             all_saved_files.extend(saved_files)
             all_errors.extend(errors)
             source_items.append(source_item)
         except HTTPException:
             raise
         except Exception as e:
-            message = f"Failed to process image {idx + 1} ({image_url}): {e}"
+            message = f"Failed to process inline image: {e}"
             all_errors.append(message)
-            source = build_source_metadata(request, image_url, idx)
+            source = build_source_metadata(request, "inline://upload", 0)
             source_items.append({
                 **source,
                 "status": "failed",
@@ -813,6 +837,27 @@ async def crop_image(request: CropRequest = Body(...)) -> JSONResponse:
                 "errors": [message],
                 "detection_attempts": [],
             })
+    else:
+        for idx, image_url in enumerate(image_urls):
+            try:
+                saved_files, errors, source_item = process_single_image(image_url, request, job_dir, image_index=idx)
+                all_saved_files.extend(saved_files)
+                all_errors.extend(errors)
+                source_items.append(source_item)
+            except HTTPException:
+                raise
+            except Exception as e:
+                message = f"Failed to process image {idx + 1} ({image_url}): {e}"
+                all_errors.append(message)
+                source = build_source_metadata(request, image_url, idx)
+                source_items.append({
+                    **source,
+                    "status": "failed",
+                    "saved_count": 0,
+                    "crops": [],
+                    "errors": [message],
+                    "detection_attempts": [],
+                })
     
     return JSONResponse({
         "status": "success",
